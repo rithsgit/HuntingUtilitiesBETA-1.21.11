@@ -1,0 +1,37 @@
+{
+  "required": true,
+  "refmap": "hunting-utilities.refmap.json",
+  "package": "com.example.addon.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "LavaMarkerMixin",
+    "PortalMakerMixin",
+    "PortalTrackerMixin"
+  ],
+"client": [
+    "ClientPlayerEntityMixin",
+    "DungeonAssistantMixin",
+    "ElytraAssistantMixin",
+    "ElytraAssistantSwingMixin",
+    "EntityGlowingMixin",
+    "EntityGlowingColorMixin",
+    "EntityRenderStateMixin",
+    "EntityRenderDispatcherMixin",
+    "HandledScreenMixin",
+    "IMouseAccessor",
+    "MixinSignBlockEntityRenderer",
+    "RocketPilotMixin",
+    "RocketPilotInputMixin",
+    "ServerHealthcareSystemMixin",
+    "ThirdSightCameraMixin",
+    "ThirdSightMouseMixin",
+    "InGameHudMixin",
+    "HandmoldMixin",
+    "HandmoldBobMixin",
+    "HeldItemRendererAccessor",
+    "TunnelersMixin"
+],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

@@ -1,0 +1,1066 @@
+package com.example.addon.modules;
+
+import com.example.addon.HuntingUtilities;
+
+import meteordevelopment.meteorclient.events.world.TickEvent;
+import meteordevelopment.meteorclient.settings.BoolSetting;
+import meteordevelopment.meteorclient.settings.DoubleSetting;
+import meteordevelopment.meteorclient.settings.EnumSetting;
+import meteordevelopment.meteorclient.settings.IntSetting;
+import meteordevelopment.meteorclient.settings.KeybindSetting;
+import meteordevelopment.meteorclient.settings.Setting;
+import meteordevelopment.meteorclient.settings.SettingGroup;
+import meteordevelopment.meteorclient.systems.modules.Module;
+import meteordevelopment.meteorclient.systems.modules.Modules;
+import meteordevelopment.meteorclient.utils.misc.Keybind;
+import meteordevelopment.meteorclient.utils.player.InvUtils;
+import meteordevelopment.orbit.EventHandler;
+import net.minecraft.entity.EquipmentSlot;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
+import net.minecraft.network.packet.c2s.play.ClientCommandC2SPacket;
+import net.minecraft.network.packet.s2c.play.PlayerPositionLookS2CPacket;
+import net.minecraft.stat.Stats;
+import net.minecraft.text.Text;
+import net.minecraft.util.Hand;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.MathHelper;
+import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.RaycastContext;
+
+public class RocketPilot extends Module {
+
+    // ─── Enums ───────────────────────────────────────────────────────────────────
+    public enum FlightMode { Normal, Oscillation, Pitch40, AltitudeBounce }
+
+    public enum FlightPattern {
+        Manual, Drunk, Grid, Circle, ZigZag, Lawnmower, FigureEight
+    }
+
+    public enum DrunkBias { None, North, South, East, West, PositiveOnly, NegativeOnly, NegPos, PosNeg }
+
+    // ─── Constants ───────────────────────────────────────────────────────────────
+    private static final int   TAKEOFF_GRACE_TICKS       = 40;
+    private static final float ELYTRA_LOW_PERCENT        = 5.0f;
+    private static final int   ELYTRA_MIN_SWAP_DUR       = 50;
+    private static final long  COLLISION_ROCKET_COOLDOWN = 200L;
+
+    // ─── Setting Groups ───────────────────────────────────────────────────────────
+    private final SettingGroup sgFlight       = settings.createGroup("Flight");
+    private final SettingGroup sgPitch40      = settings.createGroup("Pitch40");
+    private final SettingGroup sgOscillation  = settings.createGroup("Oscillation");
+    private final SettingGroup sgBounce       = settings.createGroup("Altitude Bounce");
+    private final SettingGroup sgPatterns     = settings.createGroup("Patterns");
+    private final SettingGroup sgDrunk        = settings.createGroup("DrunkPilot");
+    private final SettingGroup sgFlightSafety = settings.createGroup("Flight Safety");
+    private final SettingGroup sgPlayerSafety = settings.createGroup("Player Safety");
+
+    // ─── Flight Settings ─────────────────────────────────────────────────────────
+    public final Setting<Boolean> useTargetY = sgFlight.add(new BoolSetting.Builder()
+        .name("use-target-y").description("Whether to maintain a specific Y level.")
+        .defaultValue(true).build());
+
+    public final Setting<Double> targetY = sgFlight.add(new DoubleSetting.Builder()
+        .name("target-y").description("The Y level to maintain.")
+        .defaultValue(120.0).min(-64).max(10000).sliderRange(0, 10000)
+        .visible(useTargetY::get).build());
+
+    public final Setting<Double> flightTolerance = sgFlight.add(new DoubleSetting.Builder()
+        .name("flight-tolerance").description("Allowable drop below target Y before climbing.")
+        .defaultValue(2.0).min(0.5).max(10.0).sliderRange(1.0, 5.0).build());
+
+    public final Setting<Boolean> useFreeLookY = sgFlight.add(new BoolSetting.Builder()
+        .name("use-freelook-y").description("Render the camera at a specific Y level while flying.")
+        .defaultValue(false).build());
+
+    public final Setting<Double> freeLookY = sgFlight.add(new DoubleSetting.Builder()
+        .name("freelook-y").description("The Y level to render the camera at.")
+        .defaultValue(120.0).min(-64).max(320).sliderRange(0, 256)
+        .visible(useFreeLookY::get).build());
+
+    private final Setting<Keybind> toggleFreeLookY = sgFlight.add(new KeybindSetting.Builder()
+        .name("toggle-freelook-y").description("Key to toggle the freelook Y feature.")
+        .defaultValue(Keybind.none())
+        .action(() -> {
+            if (mc.currentScreen != null) return;
+            boolean newVal = !useFreeLookY.get();
+            useFreeLookY.set(newVal);
+            info("Freelook Y " + (newVal ? "enabled" : "disabled") + ".");
+        }).build());
+
+    private final Setting<Boolean> autoTakeoff = sgFlight.add(new BoolSetting.Builder()
+        .name("auto-takeoff").description("Automatically jump and fire a rocket to start elytra flight.")
+        .defaultValue(true).build());
+
+    private final Setting<Boolean> disableOnLand = sgFlight.add(new BoolSetting.Builder()
+        .name("disable-on-land").description("Automatically disable the module when you land.")
+        .defaultValue(false).build());
+
+    public final Setting<Integer> rocketDelay = sgFlight.add(new IntSetting.Builder()
+        .name("rocket-delay").description("Delay in milliseconds between rockets.")
+        .defaultValue(2000).min(100).sliderRange(500, 5000).build());
+
+    public final Setting<Boolean> silentRockets = sgFlight.add(new BoolSetting.Builder()
+        .name("silent-rockets").description("Suppresses the hand swing animation when firing rockets.")
+        .defaultValue(true).build());
+
+    public final Setting<FlightMode> flightMode = sgFlight.add(new EnumSetting.Builder<FlightMode>()
+        .name("flight-mode").description("The primary flight mode for pitch control.")
+        .defaultValue(FlightMode.Normal)
+        .onChanged(v -> {
+            if (!isActive() || mc.world == null) return;
+            resetPatternState();
+            switch (v) {
+                case Oscillation    -> info("Oscillation mode enabled.");
+                case Pitch40        -> info("Pitch40 mode enabled.");
+                case AltitudeBounce -> info("Altitude Bounce mode enabled.");
+                default             -> info("Normal flight mode enabled.");
+            }
+        }).build());
+
+    public final Setting<Double> pitchSmoothing = sgFlight.add(new DoubleSetting.Builder()
+        .name("pitch-smoothing").description("How smoothly pitch changes in Normal mode.")
+        .defaultValue(0.15).min(0.01).max(1.0).sliderRange(0.05, 0.5)
+        .visible(() -> flightMode.get() == FlightMode.Normal).build());
+
+    // ─── Pitch40 Settings ────────────────────────────────────────────────────────
+    private final Setting<Double> pitch40UpperY = sgPitch40.add(new DoubleSetting.Builder()
+        .name("upper-y").defaultValue(120.0).min(-64).max(320).sliderRange(0, 256)
+        .visible(() -> flightMode.get() == FlightMode.Pitch40).build());
+
+    private final Setting<Double> pitch40LowerY = sgPitch40.add(new DoubleSetting.Builder()
+        .name("lower-y").defaultValue(110.0).min(-64).max(320).sliderRange(0, 256)
+        .visible(() -> flightMode.get() == FlightMode.Pitch40).build());
+
+    private final Setting<Double> pitch40Smoothing = sgPitch40.add(new DoubleSetting.Builder()
+        .name("smoothing").defaultValue(0.05).min(0.01).max(1.0)
+        .visible(() -> flightMode.get() == FlightMode.Pitch40).build());
+
+    private final Setting<Integer> pitch40BelowMinDelay = sgPitch40.add(new IntSetting.Builder()
+        .name("below-min-delay").defaultValue(8000).min(1000).sliderRange(1000, 10000)
+        .visible(() -> flightMode.get() == FlightMode.Pitch40).build());
+
+    // ─── Oscillation Settings ────────────────────────────────────────────────────
+    public final Setting<Double> oscillationSpeed = sgOscillation.add(new DoubleSetting.Builder()
+        .name("oscillation-speed").defaultValue(0.08).min(0.01).max(0.5).sliderRange(0.02, 0.2)
+        .visible(() -> flightMode.get() == FlightMode.Oscillation).build());
+
+    private final Setting<Integer> oscillationRocketDelay = sgOscillation.add(new IntSetting.Builder()
+        .name("oscillation-rocket-delay").defaultValue(350).min(0)
+        .visible(() -> flightMode.get() == FlightMode.Oscillation).build());
+
+    private final Setting<Boolean> oscillationRockets = sgOscillation.add(new BoolSetting.Builder()
+        .name("oscillation-rockets").defaultValue(true)
+        .visible(() -> flightMode.get() == FlightMode.Oscillation).build());
+
+    // ─── Altitude Bounce Settings ─────────────────────────────────────────────────
+    private final Setting<Double> bounceClimbPitch = sgBounce.add(new DoubleSetting.Builder()
+        .name("climb-pitch").defaultValue(-35.0).min(-60.0).max(-5.0).sliderRange(-50.0, -10.0)
+        .visible(() -> flightMode.get() == FlightMode.AltitudeBounce).build());
+
+    private final Setting<Double> bounceGlidePitch = sgBounce.add(new DoubleSetting.Builder()
+        .name("glide-pitch").defaultValue(20.0).min(5.0).max(60.0).sliderRange(5.0, 45.0)
+        .visible(() -> flightMode.get() == FlightMode.AltitudeBounce).build());
+
+    private final Setting<Double> bouncePeakY = sgBounce.add(new DoubleSetting.Builder()
+        .name("peak-y").defaultValue(130.0).min(-64.0).max(10000.0).sliderRange(64.0, 256.0)
+        .visible(() -> flightMode.get() == FlightMode.AltitudeBounce).build());
+
+    private final Setting<Double> bounceFloorY = sgBounce.add(new DoubleSetting.Builder()
+        .name("floor-y").defaultValue(100.0).min(-64.0).max(320.0).sliderRange(64.0, 256.0)
+        .visible(() -> flightMode.get() == FlightMode.AltitudeBounce).build());
+
+    private final Setting<Double> bouncePitchSmoothing = sgBounce.add(new DoubleSetting.Builder()
+        .name("pitch-smoothing").defaultValue(0.08).min(0.01).max(1.0).sliderRange(0.02, 0.3)
+        .visible(() -> flightMode.get() == FlightMode.AltitudeBounce).build());
+
+    // ─── Pattern Settings ─────────────────────────────────────────────────────────
+    public final Setting<FlightPattern> flightPattern = sgPatterns.add(new EnumSetting.Builder<FlightPattern>()
+        .name("flight-pattern").defaultValue(FlightPattern.Manual)
+        .onChanged(v -> { if (isActive()) resetPatternState(); }).build());
+
+    private final Setting<Keybind> pauseKey = sgPatterns.add(new KeybindSetting.Builder()
+        .name("pause-key").defaultValue(Keybind.none()).action(this::togglePause)
+        .visible(() -> isPatternMode()).build());
+
+    private final Setting<Double> patternTurnSpeed = sgPatterns.add(new DoubleSetting.Builder()
+        .name("turn-speed").defaultValue(0.1).min(0.01).max(1.0).sliderRange(0.05, 0.5)
+        .visible(() -> flightPattern.get() != FlightPattern.Manual && flightPattern.get() != FlightPattern.Drunk).build());
+
+    private final Setting<Integer> waypointReachRadius = sgPatterns.add(new IntSetting.Builder()
+        .name("waypoint-reach-radius").defaultValue(30).min(5).sliderRange(10, 100)
+        .visible(() -> flightPattern.get() != FlightPattern.Manual && flightPattern.get() != FlightPattern.Drunk).build());
+
+    private final Setting<Integer> gridSpacing = sgPatterns.add(new IntSetting.Builder()
+        .name("grid-spacing").defaultValue(8).min(1).sliderRange(1, 32)
+        .visible(() -> flightPattern.get() == FlightPattern.Grid).build());
+
+    private final Setting<Integer> circleSegments = sgPatterns.add(new IntSetting.Builder()
+        .name("circle-segments").defaultValue(32).min(4).sliderRange(8, 128)
+        .visible(() -> flightPattern.get() == FlightPattern.Circle).build());
+
+    private final Setting<Integer> circleExpansion = sgPatterns.add(new IntSetting.Builder()
+        .name("circle-expansion").defaultValue(4).min(1).sliderRange(1, 16)
+        .visible(() -> flightPattern.get() == FlightPattern.Circle).build());
+
+    private final Setting<Integer> zigzagLegLength = sgPatterns.add(new IntSetting.Builder()
+        .name("zigzag-leg-length").defaultValue(5).min(1).sliderRange(1, 50)
+        .visible(() -> flightPattern.get() == FlightPattern.ZigZag).build());
+
+    private final Setting<Double> zigzagAngle = sgPatterns.add(new DoubleSetting.Builder()
+        .name("zigzag-angle").defaultValue(45.0).min(10.0).max(80.0).sliderRange(10.0, 80.0)
+        .visible(() -> flightPattern.get() == FlightPattern.ZigZag).build());
+
+    private final Setting<Integer> lawnmowerLegLength = sgPatterns.add(new IntSetting.Builder()
+        .name("lawnmower-leg-length").defaultValue(10).min(1).sliderRange(1, 50)
+        .visible(() -> flightPattern.get() == FlightPattern.Lawnmower).build());
+
+    private final Setting<Integer> lawnmowerSpacing = sgPatterns.add(new IntSetting.Builder()
+        .name("lawnmower-spacing").defaultValue(2).min(1).sliderRange(1, 16)
+        .visible(() -> flightPattern.get() == FlightPattern.Lawnmower).build());
+
+    private final Setting<Integer> figureEightRadius = sgPatterns.add(new IntSetting.Builder()
+        .name("figure-eight-radius").defaultValue(5).min(1).sliderRange(1, 20)
+        .visible(() -> flightPattern.get() == FlightPattern.FigureEight).build());
+
+    // ─── Drunk Settings ───────────────────────────────────────────────────────────
+    private final Setting<Integer> drunkInterval = sgDrunk.add(new IntSetting.Builder()
+        .name("change-interval").defaultValue(5).min(1).sliderRange(1, 20)
+        .visible(() -> flightPattern.get() == FlightPattern.Drunk).build());
+
+    private final Setting<Double> drunkIntensity = sgDrunk.add(new DoubleSetting.Builder()
+        .name("intensity").defaultValue(120.0).min(1.0).max(180.0).sliderRange(50.0, 180.0)
+        .visible(() -> flightPattern.get() == FlightPattern.Drunk).build());
+
+    public final Setting<DrunkBias> drunkBias = sgDrunk.add(new EnumSetting.Builder<DrunkBias>()
+        .name("coordinate-bias").defaultValue(DrunkBias.None)
+        .visible(() -> flightPattern.get() == FlightPattern.Drunk).build());
+
+    private final Setting<Double> drunkSmoothing = sgDrunk.add(new DoubleSetting.Builder()
+        .name("smoothing").defaultValue(0.05).min(0.01).max(1.0)
+        .visible(() -> flightPattern.get() == FlightPattern.Drunk).build());
+
+    // ─── Flight Safety Settings ───────────────────────────────────────────────────
+    private final Setting<Boolean> collisionAvoidance = sgFlightSafety.add(new BoolSetting.Builder()
+        .name("collision-avoidance").defaultValue(true).build());
+
+    private final Setting<Integer> avoidanceDistance = sgFlightSafety.add(new IntSetting.Builder()
+        .name("avoidance-distance").defaultValue(10).min(3).sliderRange(5, 20)
+        .visible(collisionAvoidance::get).build());
+
+    private final Setting<Boolean> netherCeilingSafety = sgFlightSafety.add(new BoolSetting.Builder()
+        .name("nether-ceiling-safety").defaultValue(true).build());
+
+    private final Setting<Integer> netherCeilingBuffer = sgFlightSafety.add(new IntSetting.Builder()
+        .name("nether-ceiling-buffer").defaultValue(15).min(3).sliderRange(5, 30)
+        .visible(netherCeilingSafety::get).build());
+
+    private final Setting<Boolean> voidSafety = sgFlightSafety.add(new BoolSetting.Builder()
+        .name("void-safety").defaultValue(true).build());
+
+    private final Setting<Integer> voidBuffer = sgFlightSafety.add(new IntSetting.Builder()
+        .name("void-buffer").defaultValue(20).min(0).sliderMax(100)
+        .visible(voidSafety::get).build());
+
+    private final Setting<Boolean> safeLanding = sgFlightSafety.add(new BoolSetting.Builder()
+        .name("safe-landing").defaultValue(true).build());
+
+    private final Setting<Integer> landingHeight = sgFlightSafety.add(new IntSetting.Builder()
+        .name("landing-height").defaultValue(20).min(5).sliderRange(10, 50)
+        .visible(safeLanding::get).build());
+
+    private final Setting<Boolean> limitRotationSpeed = sgFlightSafety.add(new BoolSetting.Builder()
+        .name("limit-rotation-speed").defaultValue(true).build());
+
+    private final Setting<Double> maxRotationPerTick = sgFlightSafety.add(new DoubleSetting.Builder()
+        .name("max-rotation-per-tick").defaultValue(20.0).min(1.0).max(90.0).sliderRange(5.0, 45.0)
+        .visible(limitRotationSpeed::get).build());
+
+    public final Setting<Integer> minRocketsWarning = sgFlightSafety.add(new IntSetting.Builder()
+        .name("min-rockets-warning").defaultValue(16).min(0).sliderRange(5, 64).build());
+
+    private final Setting<Boolean> autoLandOnLowRockets = sgFlightSafety.add(new BoolSetting.Builder()
+        .name("auto-land-on-low-rockets").defaultValue(false).build());
+
+    private final Setting<Integer> autoLandThreshold = sgFlightSafety.add(new IntSetting.Builder()
+        .name("auto-land-threshold").defaultValue(5).min(0).sliderRange(0, 20)
+        .visible(autoLandOnLowRockets::get).build());
+
+    private final Setting<Keybind> panicKey = sgFlightSafety.add(new KeybindSetting.Builder()
+        .name("panic-key").defaultValue(Keybind.none()).action(this::togglePanicLanding).build());
+
+    // ─── Player Safety Settings ───────────────────────────────────────────────────
+    private final Setting<Boolean> autoDisableOnLowHealth = sgPlayerSafety.add(new BoolSetting.Builder()
+        .name("auto-disable-on-low-health").defaultValue(true).build());
+
+    private final Setting<Integer> lowHealthThreshold = sgPlayerSafety.add(new IntSetting.Builder()
+        .name("low-health-threshold").defaultValue(3).min(1).max(10).sliderRange(1, 5)
+        .visible(autoDisableOnLowHealth::get).build());
+
+    private final Setting<Boolean> disconnectOnTotemPop = sgPlayerSafety.add(new BoolSetting.Builder()
+        .name("disconnect-on-totem-pop").defaultValue(false).build());
+
+    private final Setting<Boolean> disconnectAfterEmergencyLanding = sgPlayerSafety.add(new BoolSetting.Builder()
+        .name("disconnect-after-emergency-landing").defaultValue(true).build());
+
+    // ─── Internal State ───────────────────────────────────────────────────────────
+    public  long    lastRocketTime           = 0;
+    private boolean needsTakeoffRocket       = false;
+    private boolean ascentMode               = false;
+    private boolean pitch40Climbing          = false;
+    private boolean pitch40Rocketing         = false;
+    private long    pitch40BelowMinStartTime = -1;
+    private long    lastLagbackTime          = 0;
+    private boolean bounceClimbing           = true;
+
+    private float   targetPitch              = 0;
+    private int     waveTicks                = 0;
+    private int     drunkTimer               = 0;
+    private float   targetDrunkYaw           = 0;
+    private int     currentDrunkDuration     = 0;
+    private boolean rocketsWarningSent       = false;
+    private boolean ceilingWarningSent       = false;
+    private int     totemPops                = 0;
+    private boolean emergencyLanding         = false;
+    private int     takeoffTimer             = 0;
+    private boolean panicLanding             = false;
+    private int     takeoffWaitTicks         = 0;
+
+    private boolean paused              = false;
+    private Vec3d   origin              = null;
+    private Vec3d   currentTarget       = null;
+    private int     gridStep            = 1;
+    private int     gridStepsInLeg      = 0;
+    private int     gridDirection       = 0;
+    private float   zigzagCurrentYaw    = 0;
+    private boolean zigzagTurnRight     = true;
+    private boolean zigzagFirstLeg      = true;
+    private double  circleAngle         = 0;
+    private int     lawnmowerWaypoint   = 0;
+    private int     figureEightWaypoint = 0;
+
+    // ─── Constructor ─────────────────────────────────────────────────────────────
+    public RocketPilot() {
+        super(HuntingUtilities.CATEGORY, "rocket-pilot",
+            "Automatic elytra + rocket flight with height maintenance, auto-takeoff, and pattern flight.");
+    }
+
+    // ─── Utilities ───────────────────────────────────────────────────────────────
+    private boolean isPatternMode() {
+        return flightPattern.get() != FlightPattern.Manual && flightPattern.get() != FlightPattern.Drunk;
+    }
+
+    private void togglePause() {
+        if (mc.currentScreen != null) return;
+        if (flightPattern.get() == FlightPattern.Manual || flightPattern.get() == FlightPattern.Drunk) return;
+        paused = !paused;
+        info("Pattern flight %s.", paused ? "paused" : "resumed");
+    }
+
+    private void togglePanicLanding() {
+        if (mc.currentScreen != null) return;
+        if (panicLanding) { panicLanding = false; info("Panic landing cancelled. Resuming normal flight."); return; }
+        if (mc.player == null || !mc.player.isGliding()) { info("Not flying, cannot panic land."); return; }
+        panicLanding = true;
+        info("Panic landing initiated!");
+    }
+
+    private void resetPatternState() {
+        paused = false; origin = null; currentTarget = null;
+        gridStep = 1; gridStepsInLeg = 0; gridDirection = 0;
+        zigzagCurrentYaw = 0; zigzagTurnRight = true; zigzagFirstLeg = true;
+        circleAngle = 0; lawnmowerWaypoint = 0; figureEightWaypoint = 0;
+    }
+
+    // ─── Lifecycle ────────────────────────────────────────────────────────────────
+    @Override
+    public void onActivate() {
+        lastRocketTime           = 0;
+        needsTakeoffRocket       = false;
+        waveTicks                = 0;
+        drunkTimer               = 0;
+        currentDrunkDuration     = 0;
+        ascentMode               = false;
+        pitch40Climbing          = false;
+        pitch40Rocketing         = false;
+        pitch40BelowMinStartTime = -1;
+        bounceClimbing           = true;
+        lastLagbackTime          = 0;
+        rocketsWarningSent       = false;
+        ceilingWarningSent       = false;
+        emergencyLanding         = false;
+        takeoffTimer             = 0;
+        panicLanding             = false;
+        takeoffWaitTicks         = 0;
+
+        resetPatternState();
+
+        if (mc.player == null || mc.world == null) { toggle(); return; }
+
+        totemPops      = mc.player.getStatHandler().getStat(Stats.USED, Items.TOTEM_OF_UNDYING);
+        targetPitch    = mc.player.getPitch();
+        targetDrunkYaw = mc.player.getYaw();
+
+        if (mc.player.isGliding()) return;
+        if (!autoTakeoff.get())    return;
+
+        ItemStack elytra = mc.player.getEquippedStack(EquipmentSlot.CHEST);
+        if (elytra.isEmpty() || !elytra.isOf(Items.ELYTRA)) { error("No elytra equipped."); toggle(); return; }
+        if (countFireworks() == 0) { error("No fireworks in inventory."); toggle(); return; }
+        if (!isNearGround()) { warning("Not on ground — auto-takeoff skipped."); return; }
+
+        targetPitch = -28.0f;
+        mc.player.setPitch(targetPitch);
+        mc.player.jump();
+        needsTakeoffRocket = true;
+        info("Taking off!");
+    }
+
+    @Override
+    public void onDeactivate() {
+        needsTakeoffRocket = false;
+        takeoffWaitTicks   = 0;
+        panicLanding       = false;
+        resetPatternState();
+    }
+
+    // ─── Main Tick ────────────────────────────────────────────────────────────────
+    @EventHandler
+    private void onTick(TickEvent.Pre event) {
+        if (System.currentTimeMillis() - lastLagbackTime < 500) return;
+        if (mc.player == null || mc.world == null) return;
+
+        replenishRockets();
+
+        if (disconnectOnTotemPop.get()) {
+            int currentPops = mc.player.getStatHandler().getStat(Stats.USED, Items.TOTEM_OF_UNDYING);
+            if (currentPops > totemPops) {
+                error("Totem popped! Disconnecting...");
+                disconnect("[RocketPilot] Disconnected on totem pop.");
+                return;
+            }
+        }
+
+        if (autoDisableOnLowHealth.get()) {
+            boolean hasTotem = mc.player.getOffHandStack().isOf(Items.TOTEM_OF_UNDYING)
+                            || mc.player.getMainHandStack().isOf(Items.TOTEM_OF_UNDYING);
+            if (hasTotem && mc.player.getHealth() <= lowHealthThreshold.get() * 2f) {
+                error("Health critical (%.1f hp), disabling.", mc.player.getHealth());
+                toggle(); return;
+            }
+        }
+
+        ItemStack elytra = mc.player.getEquippedStack(EquipmentSlot.CHEST);
+        if (elytra.isEmpty() || !elytra.isOf(Items.ELYTRA)) { error("Elytra missing — disabling."); toggle(); return; }
+
+        if (takeoffTimer > 0) takeoffTimer--;
+
+        if (disableOnLand.get() && mc.player.isOnGround() && !needsTakeoffRocket && takeoffTimer == 0) {
+            info("Landed — disabling."); toggle(); return;
+        }
+
+        if (isNearGround() && !mc.player.isGliding()
+                && (!useTargetY.get() || mc.player.getY() < targetY.get())
+                && autoTakeoff.get() && countFireworks() > 0 && !needsTakeoffRocket) {
+            targetPitch = -28.0f;
+            mc.player.setPitch(targetPitch);
+            if (mc.player.isOnGround()) mc.player.jump();
+            needsTakeoffRocket = true;
+            takeoffWaitTicks   = 0;
+            info("Re-launching!");
+        }
+
+        if (needsTakeoffRocket) { handleTakeoff(); return; }
+        if (!mc.player.isGliding()) return;
+
+        handleElytraHealth();
+
+        int rockets = countFireworks();
+        if (rockets > 0 && rockets <= minRocketsWarning.get()) {
+            if (!rocketsWarningSent) { warning("Low fireworks: only %d remaining!", rockets); rocketsWarningSent = true; }
+        } else if (rockets > minRocketsWarning.get()) {
+            rocketsWarningSent = false;
+        }
+
+        if (ceilingWarningSent && mc.player.getY() < 128.0 - netherCeilingBuffer.get() - 5) ceilingWarningSent = false;
+
+        Float desiredPitch = null;
+
+        if (panicLanding) {
+            desiredPitch = handlePanicLanding();
+            if (mc.player.isOnGround() && takeoffTimer == 0) { info("Panic landing complete."); toggle(); return; }
+        }
+
+        if (autoLandOnLowRockets.get() && rockets <= autoLandThreshold.get())
+            desiredPitch = handleLowRocketLanding();
+
+        if (desiredPitch == null && emergencyLanding) {
+            desiredPitch = handleEmergencyLanding();
+            if (desiredPitch == null) return;
+        }
+
+        if (desiredPitch == null && netherCeilingSafety.get()) desiredPitch = handleNetherCeiling();
+        if (desiredPitch == null && collisionAvoidance.get())  desiredPitch = handleCollisionAvoidance();
+
+        if (desiredPitch == null && safeLanding.get() && getDistanceToGround() <= landingHeight.get())
+            desiredPitch = MathHelper.lerp(0.1f, mc.player.getPitch(), -10.0f);
+
+        if (desiredPitch == null) {
+            desiredPitch = switch (flightMode.get()) {
+                case Pitch40        -> handlePitch40Mode();
+                case Oscillation    -> handleOscillationMode();
+                case AltitudeBounce -> handleAltitudeBounceMode();
+                default             -> handleNormalMode();
+            };
+
+            FlightPattern currentPattern = flightPattern.get();
+            if      (currentPattern == FlightPattern.Drunk)  handleDrunkMode();
+            else if (currentPattern != FlightPattern.Manual) handlePatternYaw();
+        }
+
+        applyPitch(desiredPitch);
+    }
+
+    @EventHandler
+    private void onPacketReceive(meteordevelopment.meteorclient.events.packets.PacketEvent.Receive event) {
+        if (event.packet instanceof PlayerPositionLookS2CPacket) {
+            lastLagbackTime = System.currentTimeMillis();
+            mc.options.forwardKey.setPressed(false);
+        }
+    }
+
+    // ─── Takeoff ─────────────────────────────────────────────────────────────────
+    private void handleTakeoff() {
+        if (mc.player.isOnGround()) { mc.player.jump(); return; }
+
+        if (!mc.player.isGliding()) {
+            if (mc.player.networkHandler != null)
+                mc.player.networkHandler.sendPacket(
+                    new ClientCommandC2SPacket(mc.player, ClientCommandC2SPacket.Mode.START_FALL_FLYING));
+            return;
+        }
+
+        boolean rocketInHotbar = hotbarHasRocket();
+        if (!rocketInHotbar) {
+            takeoffWaitTicks++;
+            if (takeoffWaitTicks < 10) return;
+        }
+
+        if (shouldFireRocket() && countFireworks() > 0) {
+            fireRocket();
+            lastRocketTime = System.currentTimeMillis();
+        }
+
+        needsTakeoffRocket = false;
+        takeoffWaitTicks   = 0;
+        takeoffTimer       = TAKEOFF_GRACE_TICKS;
+    }
+
+    private boolean hotbarHasRocket() {
+        for (int i = 0; i < 9; i++)
+            if (mc.player.getInventory().getStack(i).isOf(Items.FIREWORK_ROCKET)) return true;
+        return false;
+    }
+
+    // ─── Elytra Health ───────────────────────────────────────────────────────────
+    private void handleElytraHealth() {
+        boolean assistantHandling = false;
+        ElytraAssistant assistant = Modules.get().get(ElytraAssistant.class);
+        if (assistant != null && assistant.isAutoSwapEnabled()) assistantHandling = true;
+
+        if (!assistantHandling && getDurabilityPercent() <= ELYTRA_LOW_PERCENT) {
+            Integer newDura = swapToFreshElytra();
+            if (newDura != null) {
+                info("Auto-swapped elytra (durability was low).");
+                emergencyLanding = false;
+            } else if (!emergencyLanding && disconnectAfterEmergencyLanding.get()) {
+                emergencyLanding = true;
+                warning("No replacement elytra found! Initiating emergency landing...");
+            }
+        }
+    }
+
+    // ─── Low Rocket Landing ───────────────────────────────────────────────────────
+    private Float handleLowRocketLanding() {
+        if (getDistanceToGround() <= landingHeight.get()) {
+            float pitch = MathHelper.lerp(0.1f, mc.player.getPitch(), -10.0f);
+            if (mc.player.isOnGround()) { info("Safe landing complete (low rockets)."); toggle(); }
+            return pitch;
+        }
+        return MathHelper.lerp(0.05f, mc.player.getPitch(), 20.0f);
+    }
+
+    // ─── Emergency Landing ────────────────────────────────────────────────────────
+    private Float handleEmergencyLanding() {
+        if (mc.player.isOnGround()) {
+            info("Emergency landing complete.");
+            if (disconnectAfterEmergencyLanding.get())
+                disconnect("[RocketPilot] Emergency landing complete — elytra critically low, no replacement found.");
+            else toggle();
+            return null;
+        }
+        float current = mc.player.getPitch();
+        return (getDistanceToGround() <= 8)
+            ? MathHelper.lerp(0.15f, current, -20.0f)
+            : MathHelper.lerp(0.05f, current,  25.0f);
+    }
+
+    // ─── Collision Avoidance ──────────────────────────────────────────────────────
+    private Float handleCollisionAvoidance() {
+        if (!mc.player.isGliding() || mc.player.getPitch() >= 30) return null;
+
+        Vec3d camPos   = mc.player.getCameraPosVec(1.0f);
+        Vec3d velocity = mc.player.getVelocity();
+        if (velocity.lengthSquared() < 0.01) return null;
+
+        Vec3d fwd    = velocity.normalize();
+        Vec3d[] rays = { fwd, fwd.rotateY(0.5f), fwd.rotateY(-0.5f) };
+
+        boolean obstacleDetected = false;
+        for (Vec3d dir : rays) {
+            BlockHitResult hit = mc.world.raycast(new RaycastContext(
+                camPos, camPos.add(dir.multiply(avoidanceDistance.get())),
+                RaycastContext.ShapeType.COLLIDER, RaycastContext.FluidHandling.NONE, mc.player));
+            if (hit.getType() == HitResult.Type.BLOCK) { obstacleDetected = true; break; }
+        }
+
+        if (!obstacleDetected) return null;
+
+        Vec3d leftDir  = fwd.rotateY(1.5f);
+        Vec3d rightDir = fwd.rotateY(-1.5f);
+        double checkDist = avoidanceDistance.get() * 1.5;
+
+        boolean leftClear  = mc.world.raycast(new RaycastContext(camPos, camPos.add(leftDir.multiply(checkDist)),
+            RaycastContext.ShapeType.COLLIDER, RaycastContext.FluidHandling.NONE, mc.player)).getType() == HitResult.Type.MISS;
+        boolean rightClear = mc.world.raycast(new RaycastContext(camPos, camPos.add(rightDir.multiply(checkDist)),
+            RaycastContext.ShapeType.COLLIDER, RaycastContext.FluidHandling.NONE, mc.player)).getType() == HitResult.Type.MISS;
+
+        float yawSpeed = 5.0f;
+        if (limitRotationSpeed.get()) yawSpeed = Math.min(yawSpeed, maxRotationPerTick.get().floatValue());
+
+        if      (leftClear && !rightClear)  mc.player.setYaw(mc.player.getYaw() + yawSpeed);
+        else if (rightClear && !leftClear)  mc.player.setYaw(mc.player.getYaw() - yawSpeed);
+        else if (leftClear && rightClear) {
+            if (mc.player.age % 2 == 0) mc.player.setYaw(mc.player.getYaw() + yawSpeed);
+            else                         mc.player.setYaw(mc.player.getYaw() - yawSpeed);
+        }
+
+        float currentPitch = mc.player.getPitch();
+        double speed       = mc.player.getVelocity().horizontalLength();
+        float pullUpStr    = (float) MathHelper.clamp(speed * 20, 20, 60);
+
+        if (shouldFireRocket() && countFireworks() > 0 && mc.player.getVelocity().y < 0.2) {
+            long now = System.currentTimeMillis();
+            if (now - lastRocketTime >= COLLISION_ROCKET_COOLDOWN) { fireRocket(); lastRocketTime = now; }
+        }
+        return MathHelper.lerp(0.3f, currentPitch, -pullUpStr);
+    }
+
+    // ─── Nether Ceiling Safety ────────────────────────────────────────────────────
+    private Float handleNetherCeiling() {
+        if (mc.world == null || mc.player == null) return null;
+        if (!mc.world.getRegistryKey().getValue().getPath().equals("the_nether")) return null;
+
+        double currentY = mc.player.getY(), netherRoof = 128.0;
+        int    buffer   = netherCeilingBuffer.get();
+        double triggerY = netherRoof - buffer;
+        if (currentY < triggerY) return null;
+
+        double danger     = MathHelper.clamp((currentY - triggerY) / buffer, 0.0, 1.0);
+        float  targetDive = (float) MathHelper.lerp(danger, 10.0, 60.0);
+        float  lerpSpeed  = (float) MathHelper.lerp(danger, 0.08, 0.35);
+
+        if (danger > 0.1 && !ceilingWarningSent) { warning("Nether ceiling! Diving to avoid bedrock."); ceilingWarningSent = true; }
+        return MathHelper.lerp(lerpSpeed, mc.player.getPitch(), targetDive);
+    }
+
+    // ─── Void Safety ──────────────────────────────────────────────────────────────
+    private Float handleVoidSafety() {
+        if (mc.world == null || mc.player == null) return null;
+        if (!mc.world.getRegistryKey().getValue().getPath().equals("the_end")) return null;
+        if (mc.player.getY() > voidBuffer.get()) return null;
+        if (shouldFireRocket() && countFireworks() > 0) {
+            long now = System.currentTimeMillis();
+            if (now - lastRocketTime >= 300) { fireRocket(); lastRocketTime = now; }
+        }
+        return -50.0f;
+    }
+
+    private Float handlePanicLanding() {
+        return (getDistanceToGround() > landingHeight.get())
+            ? MathHelper.lerp(0.05f, mc.player.getPitch(), 20.0f)
+            : MathHelper.lerp(0.1f,  mc.player.getPitch(), -10.0f);
+    }
+
+    // ─── Normal Mode ─────────────────────────────────────────────────────────────
+    private Float handleNormalMode() {
+        if (!useTargetY.get()) {
+            long now = System.currentTimeMillis();
+            if (now - lastRocketTime >= rocketDelay.get()
+                    && mc.player.getVelocity().y < 0.5
+                    && shouldFireRocket() && countFireworks() > 0) {
+                fireRocket(); lastRocketTime = now;
+            }
+            return null;
+        }
+
+        double currentY  = mc.player.getY(), target = targetY.get(), tolerance = flightTolerance.get();
+        double diff      = target - currentY;
+
+        if      (diff > tolerance) ascentMode = true;
+        else if (diff <= 0)        ascentMode = false;
+
+        if (ascentMode) {
+            long now = System.currentTimeMillis();
+            if (now - lastRocketTime >= rocketDelay.get()
+                    && mc.player.getVelocity().y < 0.5
+                    && shouldFireRocket() && countFireworks() > 0) {
+                fireRocket(); lastRocketTime = now;
+            }
+        }
+
+        float calculatedPitch;
+        if (Math.abs(diff) < 0.5) {
+            calculatedPitch = 0.0f;
+        } else {
+            calculatedPitch = (float)(-Math.tanh(diff / 10.0) * 45.0);
+            calculatedPitch = MathHelper.clamp(calculatedPitch, -45.0f, 40.0f);
+        }
+
+        targetPitch = calculatedPitch;
+        float smooth = pitchSmoothing.get().floatValue();
+        return mc.player.getPitch() + (targetPitch - mc.player.getPitch()) * smooth;
+    }
+
+    // ─── Oscillation Mode ────────────────────────────────────────────────────────
+    private Float handleOscillationMode() {
+        waveTicks++;
+        float calculatedPitch = (float)(40.0 * Math.sin(waveTicks * oscillationSpeed.get()));
+        if (oscillationRockets.get() && countFireworks() > 0 && calculatedPitch < -38.0f) {
+            long now = System.currentTimeMillis();
+            if (shouldFireRocket() && now - lastRocketTime >= oscillationRocketDelay.get()) {
+                fireRocket(); lastRocketTime = now;
+            }
+        }
+        return calculatedPitch;
+    }
+
+    // ─── Pitch40 Mode ────────────────────────────────────────────────────────────
+    private Float handlePitch40Mode() {
+        double currentY = mc.player.getY(), upperY = pitch40UpperY.get(), lowerY = pitch40LowerY.get();
+        float  smooth   = pitch40Smoothing.get().floatValue();
+
+        if      (currentY <= lowerY) { pitch40Climbing = true; }
+        else if (currentY >= upperY) { pitch40Climbing = false; pitch40Rocketing = false; }
+
+        if (currentY < lowerY) {
+            if (pitch40BelowMinStartTime < 0) pitch40BelowMinStartTime = System.currentTimeMillis();
+            if (System.currentTimeMillis() - pitch40BelowMinStartTime > pitch40BelowMinDelay.get()) pitch40Rocketing = true;
+        } else {
+            pitch40BelowMinStartTime = -1;
+        }
+
+        float pitch = pitch40Climbing
+            ? MathHelper.lerp(smooth, mc.player.getPitch(), -40f)
+            : MathHelper.lerp(smooth, mc.player.getPitch(),  40f);
+
+        if (pitch40Rocketing) {
+            long now = System.currentTimeMillis();
+            if (now - lastRocketTime >= rocketDelay.get() && shouldFireRocket() && countFireworks() > 0) {
+                fireRocket(); lastRocketTime = now;
+            }
+        }
+        return pitch;
+    }
+
+    // ─── Altitude Bounce Mode ─────────────────────────────────────────────────────
+    private Float handleAltitudeBounceMode() {
+        double currentY = mc.player.getY(), peakY = bouncePeakY.get(), floorY = bounceFloorY.get();
+        float  smooth   = bouncePitchSmoothing.get().floatValue();
+
+        if (bounceClimbing && currentY >= peakY)  bounceClimbing = false;
+        if (!bounceClimbing && currentY <= floorY) bounceClimbing = true;
+
+        if (bounceClimbing) {
+            long now = System.currentTimeMillis();
+            if (now - lastRocketTime >= rocketDelay.get()
+                    && mc.player.getVelocity().y < 0.5
+                    && shouldFireRocket() && countFireworks() > 0) {
+                fireRocket(); lastRocketTime = now;
+            }
+            return MathHelper.lerp(smooth, mc.player.getPitch(), bounceClimbPitch.get().floatValue());
+        } else {
+            return MathHelper.lerp(smooth, mc.player.getPitch(), bounceGlidePitch.get().floatValue());
+        }
+    }
+
+    // ─── Pattern Flight ───────────────────────────────────────────────────────────
+    private void handlePatternYaw() {
+        if (paused) return;
+        if (flightPattern.get() != FlightPattern.Manual && flightPattern.get() != FlightPattern.Drunk) {
+            // FIX: getPos() removed from Entity in 1.21.11 — construct Vec3d from getX/Y/Z
+            if (origin == null) origin = new Vec3d(mc.player.getX(), mc.player.getY(), mc.player.getZ());
+            if (currentTarget == null) {
+                calculateNextTarget();
+            } else {
+                double dx = currentTarget.x - mc.player.getX(), dz = currentTarget.z - mc.player.getZ();
+                int radius = waypointReachRadius.get();
+                if (dx*dx + dz*dz < (double)(radius*radius)) calculateNextTarget();
+            }
+            if (currentTarget != null) {
+                double dx = currentTarget.x - mc.player.getX(), dz = currentTarget.z - mc.player.getZ();
+                float  targetYaw  = (float) Math.toDegrees(Math.atan2(-dx, dz));
+                float  currentYaw = mc.player.getYaw();
+                float  diffYaw    = MathHelper.wrapDegrees(targetYaw - currentYaw);
+                float  yawChange  = diffYaw * patternTurnSpeed.get().floatValue();
+                if (limitRotationSpeed.get())
+                    yawChange = MathHelper.clamp(yawChange, -maxRotationPerTick.get().floatValue(), maxRotationPerTick.get().floatValue());
+                mc.player.setYaw(currentYaw + yawChange);
+            }
+        } else {
+            currentTarget = null;
+        }
+    }
+
+    private void calculateNextTarget() {
+        // FIX: getPos() removed from Entity in 1.21.11 — construct Vec3d from getX/Y/Z
+        if (origin == null) origin = new Vec3d(mc.player.getX(), mc.player.getY(), mc.player.getZ());
+        double targetYValue = useTargetY.get() ? targetY.get() : mc.player.getY();
+        double nextX, nextZ;
+        FlightPattern currentPattern = flightPattern.get();
+        if (currentPattern == FlightPattern.Manual || currentPattern == FlightPattern.Drunk) { currentTarget = null; return; }
+
+        if (currentPattern == FlightPattern.Grid) {
+            int spacing = gridSpacing.get() * 16;
+            if (currentTarget == null) {
+                gridDirection = 3; gridStepsInLeg = 0;
+                Vec3d offset = getGridDirectionOffset(gridDirection, spacing);
+                nextX = origin.x + offset.x; nextZ = origin.z + offset.z; gridStepsInLeg = 1;
+            } else {
+                if (gridStepsInLeg >= gridStep) {
+                    gridDirection = (gridDirection + 1) % 4; gridStepsInLeg = 0;
+                    if (gridDirection == 0 || gridDirection == 2) gridStep++;
+                }
+                Vec3d offset = getGridDirectionOffset(gridDirection, spacing);
+                nextX = currentTarget.x + offset.x; nextZ = currentTarget.z + offset.z; gridStepsInLeg++;
+            }
+        } else if (currentPattern == FlightPattern.ZigZag) {
+            double legLength = zigzagLegLength.get() * 16.0;
+            if (currentTarget == null) { zigzagCurrentYaw = mc.player.getYaw(); zigzagTurnRight = true; zigzagFirstLeg = true; }
+            if (zigzagFirstLeg) { zigzagFirstLeg = false; }
+            else {
+                double turnAmount = zigzagAngle.get() * 2.0;
+                zigzagCurrentYaw  = MathHelper.wrapDegrees(zigzagCurrentYaw + (float)(zigzagTurnRight ? turnAmount : -turnAmount));
+                zigzagTurnRight   = !zigzagTurnRight;
+            }
+            double radYaw = Math.toRadians(zigzagCurrentYaw);
+            Vec3d startPoint = (currentTarget != null) ? currentTarget : origin;
+            nextX = startPoint.x + (-Math.sin(radYaw) * legLength); nextZ = startPoint.z + (Math.cos(radYaw) * legLength);
+        } else if (currentPattern == FlightPattern.Lawnmower) {
+            double legLength = lawnmowerLegLength.get() * 16.0, spacing = lawnmowerSpacing.get() * 16.0;
+            int step = lawnmowerWaypoint % 4, row = lawnmowerWaypoint / 4;
+            double zOffset = row * 2 * spacing;
+            switch (step) {
+                case 0: nextX = origin.x + legLength; nextZ = origin.z + zOffset;            break;
+                case 1: nextX = origin.x + legLength; nextZ = origin.z + zOffset + spacing;  break;
+                case 2: nextX = origin.x;             nextZ = origin.z + zOffset + spacing;  break;
+                default: nextX = origin.x;            nextZ = origin.z + zOffset + 2*spacing; break;
+            }
+            lawnmowerWaypoint++;
+        } else if (currentPattern == FlightPattern.FigureEight) {
+            double r = figureEightRadius.get() * 16.0;
+            double x_off, z_off;
+            switch (figureEightWaypoint) {
+                case 0: x_off =  r; z_off =  r;   break; case 1: x_off =  0; z_off =  2*r; break;
+                case 2: x_off = -r; z_off =  r;   break; case 3: x_off =  0; z_off =   0;  break;
+                case 4: x_off = -r; z_off = -r;   break; case 5: x_off =  0; z_off = -2*r; break;
+                case 6: x_off =  r; z_off = -r;   break; default: x_off = 0; z_off =   0;  break;
+            }
+            nextX = origin.x + x_off; nextZ = origin.z + z_off;
+            figureEightWaypoint = (figureEightWaypoint + 1) % 8;
+        } else if (currentPattern == FlightPattern.Circle) {
+            double angleStep = 2.0 * Math.PI / circleSegments.get();
+            double b = (circleExpansion.get() * 16.0) / (2.0 * Math.PI);
+            double radius = b * circleAngle;
+            nextX = origin.x + radius * Math.cos(circleAngle); nextZ = origin.z + radius * Math.sin(circleAngle);
+            circleAngle += angleStep;
+        } else { return; }
+
+        currentTarget = new Vec3d(nextX, targetYValue, nextZ);
+    }
+
+    private Vec3d getGridDirectionOffset(int dir, int dist) {
+        return switch (dir) {
+            case 0 -> new Vec3d( dist, 0,    0);
+            case 1 -> new Vec3d(   0, 0, -dist);
+            case 2 -> new Vec3d(-dist, 0,    0);
+            case 3 -> new Vec3d(   0, 0,  dist);
+            default -> Vec3d.ZERO;
+        };
+    }
+
+    // ─── Drunk Mode ──────────────────────────────────────────────────────────────
+    private void handleDrunkMode() {
+        if (drunkTimer++ >= currentDrunkDuration) {
+            float intensity = drunkIntensity.get().floatValue();
+            DrunkBias bias  = drunkBias.get();
+
+            if (bias == DrunkBias.None) {
+                targetDrunkYaw = mc.player.getYaw() + (float)((Math.random() - 0.5) * 2.0 * intensity);
+            } else {
+                float minYaw, maxYaw;
+                boolean isNorth = false;
+                switch (bias) {
+                    case North        -> { isNorth = true; minYaw = 0; maxYaw = 0; }
+                    case South        -> { minYaw = -22.5f;  maxYaw =  22.5f; }
+                    case East         -> { minYaw = -112.5f; maxYaw = -67.5f; }
+                    case West         -> { minYaw =  67.5f;  maxYaw = 112.5f; }
+                    case PositiveOnly -> { minYaw = -90f;    maxYaw =   0f;   }
+                    case NegativeOnly -> { minYaw =  90f;    maxYaw = 180f;   }
+                    case NegPos       -> { minYaw =   0f;    maxYaw =  90f;   }
+                    case PosNeg       -> { minYaw = -180f;   maxYaw = -90f;   }
+                    default           -> { minYaw = -180f;   maxYaw = 180f;   }
+                }
+                targetDrunkYaw = isNorth
+                    ? 180f + ((float)Math.random() * 45f - 22.5f)
+                    : minYaw + (float)(Math.random() * (maxYaw - minYaw));
+            }
+            drunkTimer           = 0;
+            currentDrunkDuration = drunkInterval.get() + (int)(Math.random() * 10);
+        }
+
+        float currentYaw = mc.player.getYaw();
+        float diffYaw    = MathHelper.wrapDegrees(targetDrunkYaw - currentYaw);
+        float change     = diffYaw * drunkSmoothing.get().floatValue();
+        if (limitRotationSpeed.get())
+            change = MathHelper.clamp(change, -maxRotationPerTick.get().floatValue(), maxRotationPerTick.get().floatValue());
+        mc.player.setYaw(currentYaw + change);
+    }
+
+    // ─── Apply Pitch ─────────────────────────────────────────────────────────────
+    private void applyPitch(Float desiredPitch) {
+        if (desiredPitch == null) return;
+        float current = mc.player.getPitch();
+        if (limitRotationSpeed.get()) {
+            float max  = maxRotationPerTick.get().floatValue();
+            float diff = MathHelper.clamp(desiredPitch - current, -max, max);
+            mc.player.setPitch(current + diff);
+        } else {
+            mc.player.setPitch(desiredPitch);
+        }
+    }
+
+    // ─── Public Accessors ────────────────────────────────────────────────────────
+    public boolean shouldFireRocket() {
+        if (mc.player == null) return false;
+        ItemStack elytra = mc.player.getEquippedStack(EquipmentSlot.CHEST);
+        if (elytra.isEmpty() || !elytra.isOf(Items.ELYTRA)) return false;
+        if (Math.abs(mc.player.getPitch()) > 70) return false;
+        if (!needsTakeoffRocket && mc.player.getVelocity().horizontalLength() < 0.3) return false;
+        return elytra.getDamage() < elytra.getMaxDamage() - 1;
+    }
+
+    public double getDurabilityPercent() {
+        if (mc.player == null) return 100.0;
+        ItemStack elytra = mc.player.getEquippedStack(EquipmentSlot.CHEST);
+        if (elytra.isEmpty() || !elytra.isOf(Items.ELYTRA)) return 100.0;
+        return 100.0 * (elytra.getMaxDamage() - elytra.getDamage()) / (double) elytra.getMaxDamage();
+    }
+
+    public boolean isEmergencyLanding() { return emergencyLanding; }
+
+    // ─── Private Helpers ─────────────────────────────────────────────────────────
+    private void replenishRockets() {
+        for (int i = 0; i < 9; i++)
+            if (mc.player.getInventory().getStack(i).isOf(Items.FIREWORK_ROCKET)) return;
+
+        int invSlot = -1;
+        for (int i = 9; i < 36; i++)
+            if (mc.player.getInventory().getStack(i).isOf(Items.FIREWORK_ROCKET)) { invSlot = i; break; }
+        if (invSlot == -1) return;
+
+        int hotbarSlot = -1;
+        for (int i = 0; i < 9; i++)
+            if (mc.player.getInventory().getStack(i).isEmpty()) { hotbarSlot = i; break; }
+        // FIX: selectedSlot is now private — use getSelectedSlot()
+        if (hotbarSlot == -1) hotbarSlot = mc.player.getInventory().getSelectedSlot();
+        InvUtils.move().from(invSlot).toHotbar(hotbarSlot);
+    }
+
+    private int countFireworks() {
+        if (mc.player == null) return 0;
+        int count = 0;
+        for (int i = 0; i < 36; i++) {
+            ItemStack s = mc.player.getInventory().getStack(i);
+            if (s.isOf(Items.FIREWORK_ROCKET)) count += s.getCount();
+        }
+        ItemStack offhand = mc.player.getOffHandStack();
+        if (offhand.isOf(Items.FIREWORK_ROCKET)) count += offhand.getCount();
+        return count;
+    }
+
+    private Integer swapToFreshElytra() {
+        int bestSlot = -1, bestDurability = -1;
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = mc.player.getInventory().getStack(i);
+            if (stack.isOf(Items.ELYTRA)) {
+                int dur = stack.getMaxDamage() - stack.getDamage();
+                if (dur > bestDurability && dur > ELYTRA_MIN_SWAP_DUR) { bestSlot = i; bestDurability = dur; }
+            }
+        }
+        if (bestSlot == -1) return null;
+        InvUtils.move().from(bestSlot).toArmor(2);
+        return bestDurability;
+    }
+
+    private boolean isNearGround() {
+        if (mc.player == null || mc.world == null) return false;
+        if (mc.player.isOnGround()) return true;
+        BlockPos.Mutable pos = new BlockPos.Mutable();
+        for (int i = 1; i <= 3; i++) {
+            pos.set(mc.player.getX(), mc.player.getY() - i, mc.player.getZ());
+            if (mc.world.getBlockState(pos).isSolidBlock(mc.world, pos)) return true;
+        }
+        return false;
+    }
+
+    private int getDistanceToGround() {
+        if (mc.player == null || mc.world == null) return 999;
+        BlockPos.Mutable pos = new BlockPos.Mutable();
+        int max = landingHeight.get();
+        for (int i = 1; i <= max; i++) {
+            pos.set(mc.player.getX(), mc.player.getY() - i, mc.player.getZ());
+            if (!mc.world.getBlockState(pos).isAir()) return i;
+        }
+        return 999;
+    }
+
+    private void fireRocket() {
+        if (mc.player == null || mc.interactionManager == null) return;
+
+        int rocketSlot = -1;
+        for (int i = 0; i < 9; i++)
+            if (mc.player.getInventory().getStack(i).isOf(Items.FIREWORK_ROCKET)) { rocketSlot = i; break; }
+
+        if (rocketSlot == -1) {
+            if (mc.player.getOffHandStack().isOf(Items.FIREWORK_ROCKET)) {
+                mc.interactionManager.interactItem(mc.player, Hand.OFF_HAND);
+                if (!silentRockets.get()) mc.player.swingHand(Hand.OFF_HAND);
+            }
+            return;
+        }
+
+        InvUtils.swap(rocketSlot, true);
+        mc.interactionManager.interactItem(mc.player, Hand.MAIN_HAND);
+        if (!silentRockets.get()) mc.player.swingHand(Hand.MAIN_HAND);
+        InvUtils.swapBack();
+    }
+
+    private void disconnect(String reason) {
+        if (mc.player != null && mc.player.networkHandler != null)
+            mc.player.networkHandler.getConnection().disconnect(Text.literal(reason));
+        toggle();
+    }
+}
