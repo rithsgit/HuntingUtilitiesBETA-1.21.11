@@ -1,20 +1,57 @@
 package com.example.addon.hud;
 
+import com.example.addon.HuntingUtilities;
 import com.example.addon.modules.PortalTracker;
 
+import meteordevelopment.meteorclient.settings.*;
 import meteordevelopment.meteorclient.systems.hud.HudElement;
 import meteordevelopment.meteorclient.systems.hud.HudElementInfo;
 import meteordevelopment.meteorclient.systems.hud.HudRenderer;
 import meteordevelopment.meteorclient.systems.modules.Modules;
-import meteordevelopment.meteorclient.utils.render.color.Color;
+import meteordevelopment.meteorclient.utils.render.color.SettingColor;
 
 public class PortalTrackerHud extends HudElement {
-    
+
     public static final HudElementInfo<PortalTrackerHud> INFO = new HudElementInfo<>(
-        null, "Portal Tracker",
-        "portal-tracker",
-        "Shows the number of portals found.",
+        HuntingUtilities.HUD_GROUP,
+        "portal-tracker-hud",
+        "Displays portals in the area and total portals created this session.",
         PortalTrackerHud::new
+    );
+
+    private final SettingGroup sgGeneral = settings.getDefaultGroup();
+
+    private final Setting<SettingColor> labelColor = sgGeneral.add(new ColorSetting.Builder()
+        .name("label-color")
+        .defaultValue(new SettingColor(170, 170, 170, 255))
+        .build()
+    );
+
+    private final Setting<SettingColor> valueColor = sgGeneral.add(new ColorSetting.Builder()
+        .name("value-color")
+        .defaultValue(new SettingColor(255, 255, 255, 255))
+        .build()
+    );
+
+    private final Setting<SettingColor> separatorColor = sgGeneral.add(new ColorSetting.Builder()
+        .name("separator-color")
+        .description("Color of the | separator.")
+        .defaultValue(new SettingColor(100, 100, 100, 255))
+        .build()
+    );
+
+    private final Setting<Boolean> showBackground = sgGeneral.add(new BoolSetting.Builder()
+        .name("background")
+        .description("Show a background highlight behind the text.")
+        .defaultValue(false)
+        .build()
+    );
+
+    private final Setting<SettingColor> backgroundColor = sgGeneral.add(new ColorSetting.Builder()
+        .name("background-color")
+        .defaultValue(new SettingColor(0, 0, 0, 80))
+        .visible(showBackground::get)
+        .build()
     );
 
     public PortalTrackerHud() {
@@ -23,17 +60,46 @@ public class PortalTrackerHud extends HudElement {
 
     @Override
     public void render(HudRenderer renderer) {
-        PortalTracker module = Modules.get().get(PortalTracker.class);
+        PortalTracker tracker = Modules.get().get(PortalTracker.class);
 
-        if (module == null || !module.isActive()) return;
+        if (tracker == null || !tracker.isActive()) {
+            setSize(0, 0);
+            return;
+        }
 
-        int count = module.getTotalPortals();
-        if (count == 0) return;
+        double padH       = 4;
+        double padV       = 2;
+        double lineHeight = renderer.textHeight(false, 1);
+        double sepW       = renderer.textWidth(" | ", false, 1);
 
-        String text = "Portal Tracker: " + count;
-        setSize(renderer.textWidth(text, true), renderer.textHeight(true));
+        // Found = live area count (resets as portals leave range)
+        // Created = ongoing session total (never resets mid-session)
+        String foundLabel   = "Portals in Area: ";
+        String foundValue   = String.valueOf(tracker.getTotalPortals());
+        String createdLabel = "Portals Created: ";
+        String createdValue = String.valueOf(tracker.getTotalCreated());
 
-        renderer.quad(x, y, getWidth(), getHeight(), new Color(0, 0, 0, 150));
-        renderer.text(text, x, y, Color.CYAN, true);
+        double totalTextW = renderer.textWidth(foundLabel,   false, 1)
+                          + renderer.textWidth(foundValue,   false, 1)
+                          + sepW
+                          + renderer.textWidth(createdLabel, false, 1)
+                          + renderer.textWidth(createdValue, false, 1);
+
+        double totalW = totalTextW + padH * 2;
+        double totalH = lineHeight + padV * 2;
+
+        if (showBackground.get())
+            renderer.quad(x, y, totalW, totalH, backgroundColor.get());
+
+        double cx   = x + padH;
+        double rowY = y + padV;
+
+        renderer.text(foundLabel,   cx, rowY, labelColor.get(),     false, 1); cx += renderer.textWidth(foundLabel,   false, 1);
+        renderer.text(foundValue,   cx, rowY, valueColor.get(),     false, 1); cx += renderer.textWidth(foundValue,   false, 1);
+        renderer.text(" | ",        cx, rowY, separatorColor.get(), false, 1); cx += sepW;
+        renderer.text(createdLabel, cx, rowY, labelColor.get(),     false, 1); cx += renderer.textWidth(createdLabel, false, 1);
+        renderer.text(createdValue, cx, rowY, valueColor.get(),     false, 1);
+
+        setSize(totalW, totalH);
     }
 }

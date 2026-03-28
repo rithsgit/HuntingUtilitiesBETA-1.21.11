@@ -3,6 +3,11 @@ package com.example.addon;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.example.addon.hud.InfoAssistantHud;
+import com.example.addon.hud.LootLensHud;
+import com.example.addon.hud.PortalTrackerHud;
+import com.example.addon.hud.PositionHud;
+import com.example.addon.hud.StatsHud;
 import com.example.addon.modules.DungeonAssistant;
 import com.example.addon.modules.ElytraAssistant;
 import com.example.addon.modules.Graveyard;
@@ -24,6 +29,7 @@ import com.example.addon.modules.Handmold;
 import com.example.addon.modules.Mendbot;
 
 import meteordevelopment.meteorclient.addons.MeteorAddon;
+import meteordevelopment.meteorclient.systems.hud.Hud;
 import meteordevelopment.meteorclient.systems.hud.HudGroup;
 import meteordevelopment.meteorclient.systems.modules.Category;
 import meteordevelopment.meteorclient.systems.modules.Modules;
@@ -58,6 +64,13 @@ public class HuntingUtilities extends MeteorAddon {
         modules.add(new ThirdSight());
         modules.add(new Handmold());
         modules.add(new Mendbot());
+
+        // HUD elements
+        Hud.get().register(StatsHud.INFO);
+        Hud.get().register(PortalTrackerHud.INFO);
+        Hud.get().register(LootLensHud.INFO);
+        Hud.get().register(PositionHud.INFO);
+        Hud.get().register(InfoAssistantHud.INFO);
     }
 
     @Override

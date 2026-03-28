@@ -64,6 +64,9 @@ public class LootLens extends Module {
     // ─────────────────────────── State ───────────────────────────
 
     private final Map<BlockPos, StorageType>      containers                 = new HashMap<>();
+
+    public int chestCount, shulkerCount, enderCount;
+
     private final Set<BlockPos>                   inventoryCheckedContainers = new HashSet<>();
     private final Set<BlockPos>                   scannedByScanner           = new HashSet<>();
     private final Set<BlockPos>                   shulkerContainers          = new HashSet<>();
@@ -235,6 +238,16 @@ public class LootLens extends Module {
         .visible(scanShulkerBoxes::get).build()
     );
 
+    private final Setting<Boolean> scanEnderChests = sgStorage.add(new BoolSetting.Builder()
+        .name("ender-chests").description("Detect ender chests.").defaultValue(true)
+        .onChanged(v -> { if (!v) removeContainersOfType(StorageType.ENDER_CHEST); })
+        .build()
+    );
+    private final Setting<SettingColor> enderChestColor = sgStorage.add(new ColorSetting.Builder()
+        .name("ender-chest-color").defaultValue(new SettingColor(0, 100, 100, 200))
+        .visible(scanEnderChests::get).build()
+    );
+
     private final Setting<Boolean> scanChestMinecarts = sgStorage.add(new BoolSetting.Builder()
         .name("chest-minecarts").description("Detect chest minecarts.").defaultValue(true)
         .onChanged(v -> { if (!v) removeContainersOfType(StorageType.CHEST_MINECART); })
@@ -371,6 +384,7 @@ public class LootLens extends Module {
         glowItemFrameEntities.clear();
         notifiedItemFrames.clear();
         lastOpenedContainer    = null;
+        chestCount = shulkerCount = enderCount = 0;
         screenInventoryChecked = false;
         cleanupTimer           = 0;
     }
@@ -403,6 +417,7 @@ public class LootLens extends Module {
 
         BlockPos currentPos = mc.player.getBlockPos();
         scanBlockEntities(currentPos.getX() >> 4, currentPos.getZ() >> 4);
+        updateCounts();
     }
 
     @EventHandler
@@ -535,6 +550,7 @@ public class LootLens extends Module {
         if (block == Blocks.CHEST             && scanChests.get())        return StorageType.CHEST;
         if (block == Blocks.TRAPPED_CHEST     && scanTrappedChests.get()) return StorageType.TRAPPED_CHEST;
         if (block == Blocks.BARREL            && scanBarrels.get())       return StorageType.BARREL;
+        if (block == Blocks.ENDER_CHEST       && scanEnderChests.get())   return StorageType.ENDER_CHEST;
         if (block == Blocks.DISPENSER         && scanDispensers.get())    return StorageType.DISPENSER;
         if (block == Blocks.DROPPER           && scanDroppers.get())      return StorageType.DROPPER;
         if (block == Blocks.HOPPER            && scanHoppers.get())       return StorageType.HOPPER;
@@ -546,6 +562,34 @@ public class LootLens extends Module {
                 || block == Blocks.BLAST_FURNACE
                 || block == Blocks.SMOKER))                                return StorageType.FURNACE;
         return null;
+    }
+
+    private void updateCounts() {
+        int chests = 0;
+        int shulkers = 0;
+        int enders = 0;
+
+        Set<BlockPos> processedDoubleChests = new HashSet<>();
+
+        for (Map.Entry<BlockPos, StorageType> entry : containers.entrySet()) {
+            BlockPos pos = entry.getKey();
+            StorageType type = entry.getValue();
+
+            if (type == StorageType.CHEST || type == StorageType.TRAPPED_CHEST) {
+                if (processedDoubleChests.contains(pos)) continue;
+                chests++;
+                BlockPos adjacent = findAdjacentChest(pos, true);
+                if (adjacent != null) processedDoubleChests.add(adjacent);
+            } else if (type == StorageType.SHULKER_BOX) {
+                shulkers++;
+            } else if (type == StorageType.ENDER_CHEST) {
+                enders++;
+            }
+        }
+
+        this.chestCount = chests;
+        this.shulkerCount = shulkers;
+        this.enderCount = enders;
     }
 
     private void scanChestMinecarts() {
@@ -908,6 +952,7 @@ public class LootLens extends Module {
             case BARREL         -> block == Blocks.BARREL;
             case SHULKER_BOX    -> block instanceof ShulkerBoxBlock;
             case FURNACE        -> block == Blocks.FURNACE || block == Blocks.BLAST_FURNACE || block == Blocks.SMOKER;
+            case ENDER_CHEST    -> block == Blocks.ENDER_CHEST;
             case DISPENSER      -> block == Blocks.DISPENSER;
             case DROPPER        -> block == Blocks.DROPPER;
             case HOPPER         -> block == Blocks.HOPPER;
@@ -924,6 +969,7 @@ public class LootLens extends Module {
             case TRAPPED_CHEST  -> trappedChestColor.get();
             case BARREL         -> barrelColor.get();
             case SHULKER_BOX    -> shulkerBoxColor.get();
+            case ENDER_CHEST    -> enderChestColor.get();
             case CHEST_MINECART -> chestMinecartColor.get();
             case FURNACE        -> furnaceColor.get();
             case DISPENSER      -> dispenserColor.get();
@@ -942,7 +988,7 @@ public class LootLens extends Module {
     private enum StorageType {
         CHEST, TRAPPED_CHEST, BARREL, SHULKER_BOX, CHEST_MINECART,
         FURNACE, DISPENSER, DROPPER, HOPPER,
-        BREWING_STAND, CRAFTER, DECORATED_POT
+        BREWING_STAND, CRAFTER, DECORATED_POT, ENDER_CHEST
     }
 
     private record BeamData(Box box, SettingColor color) {}
